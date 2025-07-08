@@ -210,7 +210,7 @@ q_model, q_state = eqx.nn.make_with_state(TransformerFlow1D)(
 )
 
 
-class Model(eqx.Module):
+class DeconvolutionModel(eqx.Module):
     p_model: TransformerFlow1D
     q_model: TransformerFlow1D
 
@@ -222,8 +222,11 @@ class Model(eqx.Module):
         self.p_model = p_model
         self.q_model = q_model
 
+    def sample_latents(*args, **kwargs):
+        return p_model.sample_model(*args, **kwargs)
 
-model = Model(p_model, q_model)
+
+model = DeconvolutionModel(p_model, q_model)
 
 train_config_dict = dict(
     eps_sigma=eps_sigma,

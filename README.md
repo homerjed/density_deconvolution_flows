@@ -6,6 +6,10 @@
 pip install -e . 
 ```
 
+```
+uv run src/density_deconvolution/grfs.py
+```
+
 <!-- #### Samples
 
 I haven't optimised anything here (the authors mention varying the variance of noise used to dequantise the images), nor have I trained for very long. You can see slight artifacts due to the dequantisation noise.
