@@ -1,7 +1,4 @@
-<h1 align='center'>Transformer flows</h1>
-
-To implement:
-- [ ] Guidance
+<h1 align='center'>Density Deconvolution with Normalising Flows</h1>
 
 #### Usage 
 
@@ -9,7 +6,7 @@ To implement:
 pip install -e . 
 ```
 
-#### Samples
+<!-- #### Samples
 
 I haven't optimised anything here (the authors mention varying the variance of noise used to dequantise the images), nor have I trained for very long. You can see slight artifacts due to the dequantisation noise.
 
@@ -23,9 +20,21 @@ I haven't optimised anything here (the authors mention varying the variance of n
   <picture>
     <img src="assets/cifar10_warp.gif" alt="Your image description">
   </picture>
-</p>
+</p> -->
 
-#### Citation 
+#### Citations 
+
+```bibtex
+@misc{dockhorn2020densitydeconvolutionnormalizingflows,
+      title={Density Deconvolution with Normalizing Flows}, 
+      author={Tim Dockhorn and James A. Ritchie and Yaoliang Yu and Iain Murray},
+      year={2020},
+      eprint={2006.09396},
+      archivePrefix={arXiv},
+      primaryClass={stat.ML},
+      url={https://arxiv.org/abs/2006.09396}, 
+}
+```
 
 ```bibtex
 @misc{zhai2024normalizingflowscapablegenerative,
@@ -37,4 +46,4 @@ I haven't optimised anything here (the authors mention varying the variance of n
       primaryClass={cs.CV},
       url={https://arxiv.org/abs/2412.06329}, 
 }
-```# density_deconvolution_flows
+```
