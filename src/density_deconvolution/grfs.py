@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
 import optax
-from jaxtyping import Array, PRNGKeyArray, Float, Int, Bool, Scalar, DTypeLike, PyTree, jaxtyped
+from jaxtyping import Array, PRNGKeyArray, Float, Int, Bool, Scalar, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
 from einops import rearrange
@@ -62,7 +62,7 @@ dataset_name = "grfs"
 
 n_pix = 32
 
-noise_covariance = jnp.eye(n_pix) * 0.1
+noise_covariance = jnp.eye(n_pix) * 0.01
 
 
 def data_likelihood(w, v):
@@ -90,14 +90,14 @@ model_config_dict = dict(
     n_channels=1,
     patch_size=4,
     channels=128,
-    n_blocks=4,
-    layers_per_block=4,
+    n_blocks=3,
+    layers_per_block=2,
     head_dim=64,
-    expansion=4,
+    expansion=2,
     eps_sigma=eps_sigma
 )
 
-n_data = 10_000
+n_data = 40_000
 
 keys = jr.split(key, n_data)
 data = jax.vmap(generator)(keys)
@@ -115,16 +115,6 @@ target_fn = lambda *args, **kwargs: None
 v_train, v_valid = jnp.split(V, [int(0.9 * n_data)])
 w_train, w_valid = jnp.split(W, [int(0.9 * n_data)])
 
-# p_dataset = Dataset(
-#     dataset_name,
-#     x_train=v_train, 
-#     y_train=None, 
-#     x_valid=x_valid, 
-#     y_valid=None, 
-#     target_fn=target_fn, 
-#     postprocess_fn=postprocess_fn
-# )
-
 w_dataset = Dataset(
     dataset_name,
     x_train=w_train, 
@@ -137,7 +127,13 @@ w_dataset = Dataset(
 
 
 class TransformerFlow1D(TransformerFlow):
-    def __init__(self, *args, conditioning_type=None, y_dim=None, **kwargs):
+    def __init__(
+        self, 
+        *args, 
+        conditioning_type: Optional[Literal["layernorm", "embed"]] = None, 
+        y_dim: Optional[int] = None, 
+        **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.n_patches = int(kwargs["img_size"] / kwargs["patch_size"])
         self.sequence_dim = kwargs["n_channels"] * kwargs["patch_size"]
@@ -202,7 +198,7 @@ policy = Policy(
 key_p, key_q = jr.split(key)
 
 p_model, p_state = eqx.nn.make_with_state(TransformerFlow1D)(
-    **model_config_dict, conditioning_type=None, key=key_p
+    **model_config_dict, key=key_p
 )
 
 q_model, q_state = eqx.nn.make_with_state(TransformerFlow1D)(
@@ -232,6 +228,7 @@ train_config_dict = dict(
     eps_sigma=eps_sigma,
     noise_type="gaussian",
     batch_size=100,
+    K=100,
     n_epochs=1000,
     lr=1e-3,
     n_epochs_warmup=10,
@@ -241,7 +238,7 @@ train_config_dict = dict(
     use_ema=False,
     ema_rate=0.9999,
     accumulate_gradients=False,
-    n_minibatches=False,
+    n_minibatches=0,
     sample_every=1000,
     denoise_samples=True,
     n_sample=10,
@@ -293,10 +290,6 @@ def sample_model(
         return_sequence=return_sequence
     )
 
-    # If not batched together
-    # if y.shape[0] == z.shape[0]:
-    #     samples, state = eqx.filter_vmap(sample_fn)(z, y)
-    # else:
     if exists(y):
         samples, state = sample_fn(z, y) # Sampling q(v|w)
     else:
@@ -317,7 +310,7 @@ def sample_model(
 
 def ELBO(
     key: PRNGKeyArray,
-    model: Model,
+    model: DeconvolutionModel,
     w: Array,
     *,
     q_state: eqx.nn.State,
@@ -350,7 +343,7 @@ def ELBO(
     # Vmap over K-axis then batch axes e.g. (v_K)_i and w_i
     outs = eqx.filter_vmap(lambda v: eqx.filter_vmap(elbo)(v, w), in_axes=1)(v)
 
-    elbo, (loss_p, loss_q)= jax.tree.map(jnp.mean, outs)
+    elbo, (loss_p, loss_q) = jax.tree.map(jnp.mean, outs)
 
     if exists(policy):
         elbo = policy.cast_to_output(elbo)
@@ -363,8 +356,9 @@ def evaluate(
     model: TransformerFlow, 
     key: PRNGKeyArray, 
     x: Float[Array, "n _ _ _"], 
-    y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]] = None,
+    y: Optional[Float[Array, "n ..."]] = None,
     *,
+    K: int = 10,
     q_state: eqx.nn.State,
     policy: Optional[Policy] = None,
     sharding: Optional[jax.sharding.NamedSharding] = None,
@@ -380,46 +374,114 @@ def evaluate(
     return loss, metrics
 
 
+def accumulate_gradients_scan(
+    model: eqx.Module,
+    key: PRNGKeyArray,
+    x: Float[Array, "n _ _ _"], 
+    n_minibatches: int,
+    *,
+    grad_fn: Callable[
+        [
+            eqx.Module, 
+            PRNGKeyArray,
+            Float[Array, "n _ _ _"],
+            Optional[Float[Array, "n ..."]]
+        ],
+        tuple[Scalar, dict[str, Array]]
+    ]
+) -> tuple[tuple[Scalar, dict[str, Array]], PyTree]:
+
+    batch_size = x.shape[0]
+    minibatch_size = int(batch_size / n_minibatches)
+
+    keys = jr.split(key, n_minibatches)
+
+    def _minibatch_step(minibatch_idx):
+        # Gradients and metrics for a single minibatch
+
+        slicer = lambda x: jax.lax.dynamic_slice_in_dim(  
+            x, 
+            start_index=minibatch_idx * minibatch_size, 
+            slice_size=minibatch_size, 
+            axis=0
+        )
+        _x = jax.tree.map(slicer, x)
+
+        (step_L, step_metrics), step_grads = grad_fn(
+            keys[minibatch_idx], model, _x
+        )
+
+        return step_grads, step_L, step_metrics
+
+    def _scan_step(carry, minibatch_idx):
+        # Scan step function for looping over minibatches
+        step_grads, step_L, step_metrics = _minibatch_step(minibatch_idx)
+        carry = jax.tree.map(jnp.add, carry, (step_grads, step_L, step_metrics))
+        return carry, None
+
+    def _get_grads_loss_metrics_shapes():
+        # Determine initial shapes for gradients and metrics.
+        grads_shapes, L_shape, metrics_shape = jax.eval_shape(_minibatch_step, 0)
+        grads = jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shapes)
+        L = jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), L_shape)
+        metrics = jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape)
+        return grads, L, metrics
+
+    grads, L, metrics = _get_grads_loss_metrics_shapes()
+        
+    (grads, L, metrics), _ = jax.lax.scan(
+        _scan_step, 
+        init=(grads, L, metrics), 
+        xs=jnp.arange(n_minibatches), 
+        length=n_minibatches
+    )
+
+    grads = jax.tree.map(lambda g: g / n_minibatches, grads)
+    metrics = jax.tree.map(lambda m: m / n_minibatches, metrics)
+
+    return (L / n_minibatches, metrics), grads # Same signature as unaccumulated 
+
+
 @eqx.filter_jit(donate="all")
 def make_step(
-    model: Model, 
+    model: DeconvolutionModel, 
     x: Float[Array, "n _ _ _"], 
-    y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]], # Arbitrary conditioning shape is flattened
+    y: Optional[Float[Array, "n ..."]], # Arbitrary conditioning shape is flattened
     key: PRNGKeyArray, 
     opt_state: optax.OptState, 
     opt: optax.GradientTransformation,
     *,
+    K: int = 10,
     q_state: eqx.nn.State,
     n_minibatches: Optional[int] = 4,
     accumulate_gradients: Optional[bool] = False,
     policy: Optional[Policy] = None,
     sharding: Optional[jax.sharding.NamedSharding] = None,
     replicated_sharding: Optional[jax.sharding.NamedSharding] = None
-) -> tuple[Scalar, dict[str, Array], TransformerFlow1D, optax.OptState]:
+) -> tuple[
+    Scalar, dict[str, Array], TransformerFlow1D, optax.OptState
+]:
 
     model, opt_state = shard_model(model, opt_state, replicated_sharding)
     x = shard_batch(x, sharding)
 
     grad_fn = eqx.filter_value_and_grad(
-        partial(ELBO, policy=policy, q_state=q_state), has_aux=True
+        partial(ELBO, policy=policy, q_state=q_state, K=K), has_aux=True
     )
 
     if exists(policy):
         model = policy.cast_to_compute(model)
 
-    # if accumulate_gradients and n_minibatches:
-    #     loss, grads = accumulate_gradients_scan(
-    #         model, 
-    #         key, 
-    #         x, 
-    #         y, 
-    #         n_minibatches=n_minibatches, 
-    #         grad_fn=grad_fn
-    #     ) 
-    # else:
-    #     loss, grads = grad_fn(model, key, x, y)
-
-    (loss, metrics), grads = grad_fn(key, model, x)
+    if accumulate_gradients and n_minibatches:
+        (loss, metrics), grads = accumulate_gradients_scan(
+            model, 
+            key, 
+            x, 
+            n_minibatches=n_minibatches, 
+            grad_fn=grad_fn
+        ) 
+    else:
+        (loss, metrics), grads = grad_fn(key, model, x)
 
     if exists(policy):
         grads = policy.cast_to_param(grads)
@@ -436,11 +498,12 @@ def train(
     # Data
     dataset: Dataset, 
     # Model
-    model: Model,
+    model: DeconvolutionModel,
     q_state: eqx.nn.State,
     eps_sigma: Optional[float],
     noise_type: NoiseType,
     # Training
+    K: int = 10,
     batch_size: int = 256, 
     n_epochs: int = 100,
     lr: float = 2e-4,
@@ -516,6 +579,7 @@ def train(
                 opt_state, 
                 opt, 
                 q_state=q_state,
+                K=K,
                 n_minibatches=n_minibatches,
                 accumulate_gradients=accumulate_gradients,
                 policy=policy,
@@ -536,6 +600,7 @@ def train(
                     x_v, key_eps, noise_type=noise_type, eps_sigma=eps_sigma
                 ), 
                 y_v, 
+                K=K,
                 q_state=q_state,
                 policy=policy,
                 sharding=sharding,
